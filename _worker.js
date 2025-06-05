@@ -30,11 +30,18 @@ export default {
           case apiPath === '/files' && request.method === 'GET':
             return await handleGetFiles(env.ISO_BUCKET, corsHeaders);
 
-          case apiPath === '/upload-url' && request.method === 'POST':
-            return await handleGetUploadUrl(request, env.ISO_BUCKET, corsHeaders);
-
           case apiPath === '/upload' && request.method === 'POST':
-            return await handleDirectUpload(request, env.ISO_BUCKET, corsHeaders);
+            return await handleUpload(request, env.ISO_BUCKET, corsHeaders);
+            
+          // Multipart Upload API
+          case apiPath === '/multipart/create' && request.method === 'POST':
+            return await handleCreateMultipart(request, env.ISO_BUCKET, corsHeaders);
+            
+          case apiPath === '/multipart/upload-part' && request.method === 'PUT':
+            return await handleUploadPart(request, env.ISO_BUCKET, corsHeaders);
+            
+          case apiPath === '/multipart/complete' && request.method === 'POST':
+            return await handleCompleteMultipart(request, env.ISO_BUCKET, corsHeaders);
 
           case apiPath.startsWith('/download/') && request.method === 'GET':
             const downloadFileName = decodeURIComponent(apiPath.substring(10));
@@ -103,69 +110,8 @@ async function handleGetFiles(bucket, corsHeaders) {
   }
 }
 
-// S3 호환 Pre-signed URL 생성 (대용량 파일용)
-async function handleGetUploadUrl(request, bucket, corsHeaders) {
-  try {
-    const { fileName, fileSize } = await request.json();
-    
-    if (!fileName) {
-      return new Response('파일명이 필요합니다.', {
-        status: 400,
-        headers: corsHeaders
-      });
-    }
-
-    // ISO 파일 확인
-    if (!fileName.toLowerCase().endsWith('.iso')) {
-      return new Response('ISO 파일만 업로드 가능합니다.', {
-        status: 400,
-        headers: corsHeaders
-      });
-    }
-
-    // S3 호환 방식으로 Pre-signed URL 생성
-    const signedUrl = await bucket.createPresignedPost({
-      key: fileName,
-      expires: 3600, // 1시간
-      conditions: [
-        ['content-length-range', 0, 50 * 1024 * 1024 * 1024], // 최대 50GB
-        ['eq', '$Content-Type', 'application/octet-stream']
-      ]
-    });
-
-    return new Response(JSON.stringify({
-      uploadUrl: signedUrl.url,
-      formData: signedUrl.fields,
-      fileName: fileName,
-      fileSize: fileSize
-    }), {
-      headers: {
-        'Content-Type': 'application/json',
-        ...corsHeaders
-      }
-    });
-
-  } catch (error) {
-    console.error('Pre-signed URL 생성 에러:', error);
-    
-    // Fallback: 직접 업로드 URL 제공
-    return new Response(JSON.stringify({
-      uploadUrl: null,
-      useDirectUpload: true,
-      fileName: fileName,
-      fileSize: fileSize,
-      message: 'Pre-signed URL 생성 실패, 직접 업로드 모드로 전환'
-    }), {
-      headers: {
-        'Content-Type': 'application/json',
-        ...corsHeaders
-      }
-    });
-  }
-}
-
-// 직접 업로드 (모든 파일용 - Workers를 통해)
-async function handleDirectUpload(request, bucket, corsHeaders) {
+// 일반 업로드 (작은 파일용 - 100MB 이하)
+async function handleUpload(request, bucket, corsHeaders) {
   try {
     const formData = await request.formData();
     const file = formData.get('file');
@@ -185,7 +131,7 @@ async function handleDirectUpload(request, bucket, corsHeaders) {
       });
     }
 
-    console.log(`직접 업로드 시작: ${file.name}, 크기: ${file.size} bytes`);
+    console.log(`일반 업로드 시작: ${file.name}, 크기: ${file.size} bytes`);
 
     // R2에 파일 업로드
     await bucket.put(file.name, file.stream(), {
@@ -200,7 +146,7 @@ async function handleDirectUpload(request, bucket, corsHeaders) {
       }
     });
 
-    console.log(`직접 업로드 완료: ${file.name}`);
+    console.log(`일반 업로드 완료: ${file.name}`);
 
     return new Response(JSON.stringify({
       message: '업로드 완료',
@@ -215,8 +161,151 @@ async function handleDirectUpload(request, bucket, corsHeaders) {
     });
 
   } catch (error) {
-    console.error('직접 업로드 에러:', error);
+    console.error('일반 업로드 에러:', error);
     return new Response(`업로드 실패: ${error.message}`, {
+      status: 500,
+      headers: corsHeaders
+    });
+  }
+}
+
+// 멀티파트 업로드 생성 (대용량 파일용)
+async function handleCreateMultipart(request, bucket, corsHeaders) {
+  try {
+    const { fileName } = await request.json();
+    
+    if (!fileName) {
+      return new Response('파일명이 필요합니다.', {
+        status: 400,
+        headers: corsHeaders
+      });
+    }
+
+    // ISO 파일 확인
+    if (!fileName.toLowerCase().endsWith('.iso')) {
+      return new Response('ISO 파일만 업로드 가능합니다.', {
+        status: 400,
+        headers: corsHeaders
+      });
+    }
+
+    // 멀티파트 업로드 생성
+    const multipartUpload = await bucket.createMultipartUpload(fileName, {
+      httpMetadata: {
+        contentType: 'application/octet-stream',
+        contentDisposition: `attachment; filename="${fileName}"`
+      },
+      customMetadata: {
+        uploadedAt: new Date().toISOString(),
+        originalName: fileName
+      }
+    });
+
+    console.log(`멀티파트 업로드 생성: ${fileName}, uploadId: ${multipartUpload.uploadId}`);
+
+    return new Response(JSON.stringify({
+      key: multipartUpload.key,
+      uploadId: multipartUpload.uploadId,
+      fileName: fileName
+    }), {
+      headers: {
+        'Content-Type': 'application/json',
+        ...corsHeaders
+      }
+    });
+
+  } catch (error) {
+    console.error('멀티파트 업로드 생성 에러:', error);
+    return new Response(`멀티파트 업로드 생성 실패: ${error.message}`, {
+      status: 500,
+      headers: corsHeaders
+    });
+  }
+}
+
+// 멀티파트 파트 업로드
+async function handleUploadPart(request, bucket, corsHeaders) {
+  try {
+    const url = new URL(request.url);
+    const uploadId = url.searchParams.get('uploadId');
+    const partNumber = parseInt(url.searchParams.get('partNumber'));
+    const key = url.searchParams.get('key');
+    
+    if (!uploadId || !partNumber || !key) {
+      return new Response('uploadId, partNumber, key가 필요합니다.', {
+        status: 400,
+        headers: corsHeaders
+      });
+    }
+
+    if (!request.body) {
+      return new Response('파트 데이터가 필요합니다.', {
+        status: 400,
+        headers: corsHeaders
+      });
+    }
+
+    // 멀티파트 업로드 재개
+    const multipartUpload = bucket.resumeMultipartUpload(key, uploadId);
+    
+    // 파트 업로드
+    const uploadedPart = await multipartUpload.uploadPart(partNumber, request.body);
+    
+    console.log(`파트 업로드 완료: ${key}, 파트 ${partNumber}, ETag: ${uploadedPart.etag}`);
+
+    return new Response(JSON.stringify({
+      partNumber: uploadedPart.partNumber,
+      etag: uploadedPart.etag
+    }), {
+      headers: {
+        'Content-Type': 'application/json',
+        ...corsHeaders
+      }
+    });
+
+  } catch (error) {
+    console.error('파트 업로드 에러:', error);
+    return new Response(`파트 업로드 실패: ${error.message}`, {
+      status: 500,
+      headers: corsHeaders
+    });
+  }
+}
+
+// 멀티파트 업로드 완료
+async function handleCompleteMultipart(request, bucket, corsHeaders) {
+  try {
+    const { key, uploadId, parts } = await request.json();
+    
+    if (!key || !uploadId || !parts) {
+      return new Response('key, uploadId, parts가 필요합니다.', {
+        status: 400,
+        headers: corsHeaders
+      });
+    }
+
+    // 멀티파트 업로드 재개
+    const multipartUpload = bucket.resumeMultipartUpload(key, uploadId);
+    
+    // 업로드 완료
+    const object = await multipartUpload.complete(parts);
+    
+    console.log(`멀티파트 업로드 완료: ${key}, ETag: ${object.httpEtag}`);
+
+    return new Response(JSON.stringify({
+      message: '멀티파트 업로드 완료',
+      fileName: key,
+      etag: object.httpEtag
+    }), {
+      headers: {
+        'Content-Type': 'application/json',
+        ...corsHeaders
+      }
+    });
+
+  } catch (error) {
+    console.error('멀티파트 업로드 완료 에러:', error);
+    return new Response(`멀티파트 업로드 완료 실패: ${error.message}`, {
       status: 500,
       headers: corsHeaders
     });
@@ -310,7 +399,8 @@ async function handleStaticFiles(request, env) {
                 <div class="upload-area" id="uploadArea">
                     <div class="upload-content">
                         <div class="upload-icon"></div>
-                        <p>ISO 파일을 드래그 앤 드롭하거나 클릭하여 선택하세요</p>
+                        <p>ISO 파일을 드래그 앤 드롭하거나 클릭하여 선택하세요<br>
+                        <small>소용량(≤100MB): 일반 업로드 | 대용량(>100MB): 멀티파트 업로드</small></p>
                         <input type="file" id="fileInput" accept=".iso" multiple style="display: none;">
                         <button class="btn-primary" id="selectFileBtn">
                             파일 선택
@@ -666,6 +756,10 @@ const filesList = document.getElementById('filesList');
 const toast = document.getElementById('toast');
 const selectFileBtn = document.getElementById('selectFileBtn');
 
+// 멀티파트 업로드 설정
+const MULTIPART_THRESHOLD = 100 * 1024 * 1024; // 100MB
+const PART_SIZE = 10 * 1024 * 1024; // 10MB per part
+
 document.addEventListener('DOMContentLoaded', function() {
     initializeEventListeners();
     refreshFileList();
@@ -762,11 +856,18 @@ async function uploadFiles(files) {
 async function uploadFile(file, current, total) {
     uploadProgress.style.display = 'block';
     progressFill.style.width = '0%';
-    progressText.textContent = '업로드 준비 중...';
+    progressText.textContent = '업로드 방식 확인 중...';
     
     try {
-        // 모든 파일을 직접 업로드로 처리 (단순화)
-        await directUpload(file, current, total);
+        if (file.size > MULTIPART_THRESHOLD) {
+            // 대용량 파일: 멀티파트 업로드
+            progressText.textContent = '대용량 파일 - 멀티파트 업로드 중... (' + formatFileSize(file.size) + ')';
+            await multipartUpload(file, current, total);
+        } else {
+            // 소용량 파일: 일반 업로드
+            progressText.textContent = '소용량 파일 - 일반 업로드 중... (' + formatFileSize(file.size) + ')';
+            await normalUpload(file, current, total);
+        }
         
     } catch (error) {
         showToast('업로드 에러: ' + error.message, 'error');
@@ -779,12 +880,10 @@ async function uploadFile(file, current, total) {
     }, 1500);
 }
 
-// 직접 업로드 (모든 파일)
-async function directUpload(file, current, total) {
+// 일반 업로드 (100MB 이하)
+async function normalUpload(file, current, total) {
     const formData = new FormData();
     formData.append('file', file);
-    
-    progressText.textContent = '업로드 중... (' + formatFileSize(file.size) + ')';
     
     const response = await fetch(API_BASE + '/upload', {
         method: 'POST',
@@ -794,11 +893,94 @@ async function directUpload(file, current, total) {
     if (response.ok) {
         progressFill.style.width = '100%';
         progressText.textContent = '100%';
-        const result = await response.json();
-        showToast(file.name + ' 업로드 완료! (' + current + '/' + total + ')', 'success');
+        showToast(file.name + ' 일반 업로드 완료! (' + current + '/' + total + ')', 'success');
     } else {
         const error = await response.text();
         throw new Error(error);
+    }
+}
+
+// 멀티파트 업로드 (100MB 초과)
+async function multipartUpload(file, current, total) {
+    try {
+        // 1. 멀티파트 업로드 생성
+        progressText.textContent = '멀티파트 업로드 시작...';
+        
+        const createResponse = await fetch(API_BASE + '/multipart/create', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                fileName: file.name
+            })
+        });
+        
+        if (!createResponse.ok) {
+            throw new Error('멀티파트 업로드 생성 실패');
+        }
+        
+        const { key, uploadId } = await createResponse.json();
+        
+        // 2. 파일을 파트로 나누어 업로드
+        const partCount = Math.ceil(file.size / PART_SIZE);
+        const uploadedParts = [];
+        
+        for (let partNumber = 1; partNumber <= partCount; partNumber++) {
+            const start = (partNumber - 1) * PART_SIZE;
+            const end = Math.min(start + PART_SIZE, file.size);
+            const partData = file.slice(start, end);
+            
+            progressText.textContent = '멀티파트 업로드 중... 파트 ' + partNumber + '/' + partCount + ' (' + Math.round((partNumber / partCount) * 100) + '%)';
+            progressFill.style.width = (partNumber / partCount * 90) + '%'; // 90%까지 진행 표시
+            
+            const partResponse = await fetch(API_BASE + '/multipart/upload-part?' + new URLSearchParams({
+                uploadId: uploadId,
+                partNumber: partNumber.toString(),
+                key: key
+            }), {
+                method: 'PUT',
+                body: partData
+            });
+            
+            if (!partResponse.ok) {
+                throw new Error('파트 ' + partNumber + ' 업로드 실패');
+            }
+            
+            const partResult = await partResponse.json();
+            uploadedParts.push({
+                partNumber: partResult.partNumber,
+                etag: partResult.etag
+            });
+        }
+        
+        // 3. 멀티파트 업로드 완료
+        progressText.textContent = '멀티파트 업로드 완료 중...';
+        progressFill.style.width = '95%';
+        
+        const completeResponse = await fetch(API_BASE + '/multipart/complete', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                key: key,
+                uploadId: uploadId,
+                parts: uploadedParts
+            })
+        });
+        
+        if (completeResponse.ok) {
+            progressFill.style.width = '100%';
+            progressText.textContent = '100%';
+            showToast(file.name + ' 멀티파트 업로드 완료! (' + current + '/' + total + ')', 'success');
+        } else {
+            throw new Error('멀티파트 업로드 완료 실패');
+        }
+        
+    } catch (error) {
+        console.error('멀티파트 업로드 에러:', error);
+        throw error;
     }
 }
 
