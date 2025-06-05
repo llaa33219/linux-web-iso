@@ -1,0 +1,24 @@
+{
+  "name": "linux-iso-manager",
+  "version": "1.0.0",
+  "description": "Cloudflare Pages + Workers를 사용한 Linux ISO 파일 관리 시스템",
+  "main": "_worker.js",
+  "scripts": {
+    "dev": "wrangler pages dev .",
+    "deploy": "wrangler pages publish .",
+    "tail": "wrangler tail"
+  },
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "pages",
+    "r2",
+    "iso",
+    "linux"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+} 
