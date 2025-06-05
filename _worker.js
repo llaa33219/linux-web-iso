@@ -103,7 +103,7 @@ async function handleGetFiles(bucket, corsHeaders) {
   }
 }
 
-// Pre-signed URL 생성 (대용량 파일용)
+// S3 호환 Pre-signed URL 생성 (대용량 파일용)
 async function handleGetUploadUrl(request, bucket, corsHeaders) {
   try {
     const { fileName, fileSize } = await request.json();
@@ -123,16 +123,19 @@ async function handleGetUploadUrl(request, bucket, corsHeaders) {
       });
     }
 
-    // R2 Pre-signed URL 생성 (24시간 유효)
-    const signedUrl = await bucket.createPresignedUrl('PUT', fileName, {
-      expiresIn: 86400, // 24시간
-      httpMetadata: {
-        contentType: 'application/octet-stream'
-      }
+    // S3 호환 방식으로 Pre-signed URL 생성
+    const signedUrl = await bucket.createPresignedPost({
+      key: fileName,
+      expires: 3600, // 1시간
+      conditions: [
+        ['content-length-range', 0, 50 * 1024 * 1024 * 1024], // 최대 50GB
+        ['eq', '$Content-Type', 'application/octet-stream']
+      ]
     });
 
     return new Response(JSON.stringify({
-      uploadUrl: signedUrl,
+      uploadUrl: signedUrl.url,
+      formData: signedUrl.fields,
       fileName: fileName,
       fileSize: fileSize
     }), {
@@ -144,14 +147,24 @@ async function handleGetUploadUrl(request, bucket, corsHeaders) {
 
   } catch (error) {
     console.error('Pre-signed URL 생성 에러:', error);
-    return new Response(`업로드 URL 생성 실패: ${error.message}`, {
-      status: 500,
-      headers: corsHeaders
+    
+    // Fallback: 직접 업로드 URL 제공
+    return new Response(JSON.stringify({
+      uploadUrl: null,
+      useDirectUpload: true,
+      fileName: fileName,
+      fileSize: fileSize,
+      message: 'Pre-signed URL 생성 실패, 직접 업로드 모드로 전환'
+    }), {
+      headers: {
+        'Content-Type': 'application/json',
+        ...corsHeaders
+      }
     });
   }
 }
 
-// 직접 업로드 (소용량 파일용 - 100MB 이하)
+// 직접 업로드 (모든 파일용 - Workers를 통해)
 async function handleDirectUpload(request, bucket, corsHeaders) {
   try {
     const formData = await request.formData();
@@ -752,16 +765,8 @@ async function uploadFile(file, current, total) {
     progressText.textContent = '업로드 준비 중...';
     
     try {
-        // 파일 크기에 따라 업로드 방식 결정
-        const directUploadLimit = 100 * 1024 * 1024; // 100MB
-        
-        if (file.size <= directUploadLimit) {
-            // 100MB 이하는 직접 업로드
-            await directUpload(file, current, total);
-        } else {
-            // 100MB 초과는 Pre-signed URL 사용
-            await presignedUpload(file, current, total);
-        }
+        // 모든 파일을 직접 업로드로 처리 (단순화)
+        await directUpload(file, current, total);
         
     } catch (error) {
         showToast('업로드 에러: ' + error.message, 'error');
@@ -774,12 +779,12 @@ async function uploadFile(file, current, total) {
     }, 1500);
 }
 
-// 직접 업로드 (100MB 이하)
+// 직접 업로드 (모든 파일)
 async function directUpload(file, current, total) {
     const formData = new FormData();
     formData.append('file', file);
     
-    progressText.textContent = '직접 업로드 중...';
+    progressText.textContent = '업로드 중... (' + formatFileSize(file.size) + ')';
     
     const response = await fetch(API_BASE + '/upload', {
         method: 'POST',
@@ -794,49 +799,6 @@ async function directUpload(file, current, total) {
     } else {
         const error = await response.text();
         throw new Error(error);
-    }
-}
-
-// Pre-signed URL 업로드 (대용량 파일)
-async function presignedUpload(file, current, total) {
-    progressText.textContent = '업로드 URL 생성 중...';
-    
-    // 1. Pre-signed URL 요청
-    const urlResponse = await fetch(API_BASE + '/upload-url', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-            fileName: file.name,
-            fileSize: file.size
-        })
-    });
-    
-    if (!urlResponse.ok) {
-        const error = await urlResponse.text();
-        throw new Error(error);
-    }
-    
-    const { uploadUrl } = await urlResponse.json();
-    
-    progressText.textContent = '대용량 파일 업로드 중...';
-    
-    // 2. Pre-signed URL로 직접 업로드
-    const uploadResponse = await fetch(uploadUrl, {
-        method: 'PUT',
-        body: file,
-        headers: {
-            'Content-Type': 'application/octet-stream'
-        }
-    });
-    
-    if (uploadResponse.ok) {
-        progressFill.style.width = '100%';
-        progressText.textContent = '100%';
-        showToast(file.name + ' 대용량 업로드 완료! (' + current + '/' + total + ')', 'success');
-    } else {
-        throw new Error('Pre-signed URL 업로드 실패');
     }
 }
 
