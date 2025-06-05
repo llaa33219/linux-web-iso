@@ -30,8 +30,11 @@ export default {
           case apiPath === '/files' && request.method === 'GET':
             return await handleGetFiles(env.ISO_BUCKET, corsHeaders);
 
+          case apiPath === '/upload-url' && request.method === 'POST':
+            return await handleGetUploadUrl(request, env.ISO_BUCKET, corsHeaders);
+
           case apiPath === '/upload' && request.method === 'POST':
-            return await handleUpload(request, env.ISO_BUCKET, corsHeaders);
+            return await handleDirectUpload(request, env.ISO_BUCKET, corsHeaders);
 
           case apiPath.startsWith('/download/') && request.method === 'GET':
             const downloadFileName = decodeURIComponent(apiPath.substring(10));
@@ -100,8 +103,56 @@ async function handleGetFiles(bucket, corsHeaders) {
   }
 }
 
-// 파일 업로드
-async function handleUpload(request, bucket, corsHeaders) {
+// Pre-signed URL 생성 (대용량 파일용)
+async function handleGetUploadUrl(request, bucket, corsHeaders) {
+  try {
+    const { fileName, fileSize } = await request.json();
+    
+    if (!fileName) {
+      return new Response('파일명이 필요합니다.', {
+        status: 400,
+        headers: corsHeaders
+      });
+    }
+
+    // ISO 파일 확인
+    if (!fileName.toLowerCase().endsWith('.iso')) {
+      return new Response('ISO 파일만 업로드 가능합니다.', {
+        status: 400,
+        headers: corsHeaders
+      });
+    }
+
+    // R2 Pre-signed URL 생성 (24시간 유효)
+    const signedUrl = await bucket.createPresignedUrl('PUT', fileName, {
+      expiresIn: 86400, // 24시간
+      httpMetadata: {
+        contentType: 'application/octet-stream'
+      }
+    });
+
+    return new Response(JSON.stringify({
+      uploadUrl: signedUrl,
+      fileName: fileName,
+      fileSize: fileSize
+    }), {
+      headers: {
+        'Content-Type': 'application/json',
+        ...corsHeaders
+      }
+    });
+
+  } catch (error) {
+    console.error('Pre-signed URL 생성 에러:', error);
+    return new Response(`업로드 URL 생성 실패: ${error.message}`, {
+      status: 500,
+      headers: corsHeaders
+    });
+  }
+}
+
+// 직접 업로드 (소용량 파일용 - 100MB 이하)
+async function handleDirectUpload(request, bucket, corsHeaders) {
   try {
     const formData = await request.formData();
     const file = formData.get('file');
@@ -121,14 +172,7 @@ async function handleUpload(request, bucket, corsHeaders) {
       });
     }
 
-    // 파일 크기 제한 (예: 10GB)
-    const maxSize = 10 * 1024 * 1024 * 1024; // 10GB
-    if (file.size > maxSize) {
-      return new Response('파일 크기가 너무 큽니다. (최대 10GB)', {
-        status: 400,
-        headers: corsHeaders
-      });
-    }
+    console.log(`직접 업로드 시작: ${file.name}, 크기: ${file.size} bytes`);
 
     // R2에 파일 업로드
     await bucket.put(file.name, file.stream(), {
@@ -138,16 +182,27 @@ async function handleUpload(request, bucket, corsHeaders) {
       },
       customMetadata: {
         uploadedAt: new Date().toISOString(),
-        originalName: file.name
+        originalName: file.name,
+        fileSize: file.size.toString()
       }
     });
 
-    return new Response('업로드 완료', {
+    console.log(`직접 업로드 완료: ${file.name}`);
+
+    return new Response(JSON.stringify({
+      message: '업로드 완료',
+      fileName: file.name,
+      fileSize: file.size
+    }), {
       status: 200,
-      headers: corsHeaders
+      headers: {
+        'Content-Type': 'application/json',
+        ...corsHeaders
+      }
     });
 
   } catch (error) {
+    console.error('직접 업로드 에러:', error);
     return new Response(`업로드 실패: ${error.message}`, {
       status: 500,
       headers: corsHeaders
@@ -244,7 +299,7 @@ async function handleStaticFiles(request, env) {
                         <div class="upload-icon"></div>
                         <p>ISO 파일을 드래그 앤 드롭하거나 클릭하여 선택하세요</p>
                         <input type="file" id="fileInput" accept=".iso" multiple style="display: none;">
-                        <button class="btn-primary" onclick="document.getElementById('fileInput').click()">
+                        <button class="btn-primary" id="selectFileBtn">
                             파일 선택
                         </button>
                     </div>
@@ -411,6 +466,12 @@ h2 {
     box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
 }
 
+.btn-primary:disabled {
+    background-color: #6c757d;
+    cursor: not-allowed;
+    transform: none;
+}
+
 .btn-secondary {
     background: #f8f9fa;
     color: #495057;
@@ -563,6 +624,11 @@ h2 {
         gap: 15px;
         align-items: flex-start;
     }
+    
+    .btn-primary {
+        width: 100%;
+        font-size: 20px;
+    }
 }`, {
       headers: {
         'Content-Type': 'text/css; charset=utf-8',
@@ -576,6 +642,8 @@ h2 {
     return new Response(`// API 엔드포인트
 const API_BASE = '/api';
 
+let isUploading = false;
+
 const fileInput = document.getElementById('fileInput');
 const uploadArea = document.getElementById('uploadArea');
 const uploadProgress = document.getElementById('uploadProgress');
@@ -583,6 +651,7 @@ const progressFill = document.getElementById('progressFill');
 const progressText = document.getElementById('progressText');
 const filesList = document.getElementById('filesList');
 const toast = document.getElementById('toast');
+const selectFileBtn = document.getElementById('selectFileBtn');
 
 document.addEventListener('DOMContentLoaded', function() {
     initializeEventListeners();
@@ -594,12 +663,30 @@ function initializeEventListeners() {
     uploadArea.addEventListener('dragover', handleDragOver);
     uploadArea.addEventListener('dragleave', handleDragLeave);
     uploadArea.addEventListener('drop', handleDrop);
-    uploadArea.addEventListener('click', () => fileInput.click());
+    
+    // 클릭 이벤트를 버튼에만 연결 (중복 방지)
+    selectFileBtn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        if (!isUploading) {
+            fileInput.click();
+        }
+    });
+    
+    // 업로드 영역 클릭은 드래그앤드롭 영역에서만
+    uploadArea.addEventListener('click', function(e) {
+        if (e.target === uploadArea || e.target.classList.contains('upload-content')) {
+            if (!isUploading) {
+                fileInput.click();
+            }
+        }
+    });
 }
 
 function handleDragOver(e) {
     e.preventDefault();
-    uploadArea.classList.add('dragover');
+    if (!isUploading) {
+        uploadArea.classList.add('dragover');
+    }
 }
 
 function handleDragLeave(e) {
@@ -610,6 +697,11 @@ function handleDragLeave(e) {
 function handleDrop(e) {
     e.preventDefault();
     uploadArea.classList.remove('dragover');
+    
+    if (isUploading) {
+        showToast('업로드 진행 중입니다. 잠시 기다려주세요.', 'error');
+        return;
+    }
     
     const files = Array.from(e.dataTransfer.files).filter(file => 
         file.name.toLowerCase().endsWith('.iso')
@@ -623,6 +715,11 @@ function handleDrop(e) {
 }
 
 function handleFileSelect(e) {
+    if (isUploading) {
+        showToast('업로드 진행 중입니다. 잠시 기다려주세요.', 'error');
+        return;
+    }
+    
     const files = Array.from(e.target.files);
     if (files.length > 0) {
         uploadFiles(files);
@@ -630,32 +727,42 @@ function handleFileSelect(e) {
 }
 
 async function uploadFiles(files) {
-    for (let i = 0; i < files.length; i++) {
-        await uploadFile(files[i], i + 1, files.length);
+    if (isUploading) return;
+    
+    isUploading = true;
+    selectFileBtn.disabled = true;
+    selectFileBtn.textContent = '업로드 중...';
+    
+    try {
+        for (let i = 0; i < files.length; i++) {
+            await uploadFile(files[i], i + 1, files.length);
+        }
+        refreshFileList();
+    } finally {
+        isUploading = false;
+        selectFileBtn.disabled = false;
+        selectFileBtn.textContent = '파일 선택';
+        fileInput.value = ''; // 파일 입력 초기화
     }
-    refreshFileList();
 }
 
 async function uploadFile(file, current, total) {
-    const formData = new FormData();
-    formData.append('file', file);
-    
     uploadProgress.style.display = 'block';
+    progressFill.style.width = '0%';
+    progressText.textContent = '업로드 준비 중...';
     
     try {
-        const response = await fetch(API_BASE + '/upload', {
-            method: 'POST',
-            body: formData
-        });
+        // 파일 크기에 따라 업로드 방식 결정
+        const directUploadLimit = 100 * 1024 * 1024; // 100MB
         
-        if (response.ok) {
-            progressFill.style.width = '100%';
-            progressText.textContent = '100%';
-            showToast(file.name + ' 업로드 완료! (' + current + '/' + total + ')', 'success');
+        if (file.size <= directUploadLimit) {
+            // 100MB 이하는 직접 업로드
+            await directUpload(file, current, total);
         } else {
-            const error = await response.text();
-            showToast('업로드 실패: ' + error, 'error');
+            // 100MB 초과는 Pre-signed URL 사용
+            await presignedUpload(file, current, total);
         }
+        
     } catch (error) {
         showToast('업로드 에러: ' + error.message, 'error');
     }
@@ -664,7 +771,73 @@ async function uploadFile(file, current, total) {
         uploadProgress.style.display = 'none';
         progressFill.style.width = '0%';
         progressText.textContent = '0%';
-    }, 1000);
+    }, 1500);
+}
+
+// 직접 업로드 (100MB 이하)
+async function directUpload(file, current, total) {
+    const formData = new FormData();
+    formData.append('file', file);
+    
+    progressText.textContent = '직접 업로드 중...';
+    
+    const response = await fetch(API_BASE + '/upload', {
+        method: 'POST',
+        body: formData
+    });
+    
+    if (response.ok) {
+        progressFill.style.width = '100%';
+        progressText.textContent = '100%';
+        const result = await response.json();
+        showToast(file.name + ' 업로드 완료! (' + current + '/' + total + ')', 'success');
+    } else {
+        const error = await response.text();
+        throw new Error(error);
+    }
+}
+
+// Pre-signed URL 업로드 (대용량 파일)
+async function presignedUpload(file, current, total) {
+    progressText.textContent = '업로드 URL 생성 중...';
+    
+    // 1. Pre-signed URL 요청
+    const urlResponse = await fetch(API_BASE + '/upload-url', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            fileName: file.name,
+            fileSize: file.size
+        })
+    });
+    
+    if (!urlResponse.ok) {
+        const error = await urlResponse.text();
+        throw new Error(error);
+    }
+    
+    const { uploadUrl } = await urlResponse.json();
+    
+    progressText.textContent = '대용량 파일 업로드 중...';
+    
+    // 2. Pre-signed URL로 직접 업로드
+    const uploadResponse = await fetch(uploadUrl, {
+        method: 'PUT',
+        body: file,
+        headers: {
+            'Content-Type': 'application/octet-stream'
+        }
+    });
+    
+    if (uploadResponse.ok) {
+        progressFill.style.width = '100%';
+        progressText.textContent = '100%';
+        showToast(file.name + ' 대용량 업로드 완료! (' + current + '/' + total + ')', 'success');
+    } else {
+        throw new Error('Pre-signed URL 업로드 실패');
+    }
 }
 
 async function refreshFileList() {
